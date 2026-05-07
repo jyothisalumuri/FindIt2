@@ -188,12 +188,25 @@ export default function App() {
 
     setUploading(true);
     try {
-      let media_urls: string[] = [];
-      if (formData.media.length > 0) {
-        media_urls = await handleFileUpload(formData.media);
+      // 1. Check Connection/Config
+      if (import.meta.env.VITE_SUPABASE_URL.includes('your-project-id')) {
+        throw new Error('Supabase URL is not configured. Please add your real Supabase URL and Key to your Environment Variables.');
       }
 
-      const { error } = await supabase.from('items').insert([{
+      let media_urls: string[] = [];
+      if (formData.media.length > 0) {
+        try {
+          media_urls = await handleFileUpload(formData.media);
+          if (formData.media.length > 0 && media_urls.length === 0) {
+            throw new Error('Media upload failed. Please check if your "item-images" bucket exists in Supabase and is set to Public.');
+          }
+        } catch (storageErr: any) {
+          throw new Error(`Storage Error: ${storageErr.message || 'Check your bucket name and policies.'}`);
+        }
+      }
+
+      // 2. Database Insert
+      const { error, status, statusText } = await supabase.from('items').insert([{
         title: formData.title,
         description: formData.desc,
         category: formData.category,
@@ -207,7 +220,13 @@ export default function App() {
         date: formData.date
       }]);
 
-      if (error) throw error;
+      if (error) {
+        console.error('Database insertion error:', error);
+        if (error.message.includes('column "media_urls" does not exist')) {
+          throw new Error('Database Schema Mismatch: Did you run the updated SQL in Supabase? The table needs a "media_urls" column (type TEXT[]).');
+        }
+        throw new Error(`Database Error: ${error.message} (Status: ${status} ${statusText})`);
+      }
 
       showToast(`Success! Your ${formData.type} report has been posted.`, 'success');
       setShowReportModal(false);
