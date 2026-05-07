@@ -39,6 +39,8 @@ interface Item {
   reporter_roll: string;
   reporter_email: string;
   created_at: string;
+  verification_question?: string;
+  verification_answer?: string;
 }
 
 interface Notification {
@@ -72,17 +74,43 @@ export default function App() {
   const [selectedItem, setSelectedItem] = useState<Item | null>(null);
   const [showNotifPanel, setShowNotifPanel] = useState(false);
   const [toast, setToast] = useState<{ msg: string, type: 'success' | 'error' | 'info' } | null>(null);
+  const [confirmAction, setConfirmAction] = useState<{
+    id: number;
+    type: 'resolve' | 'delete';
+    title: string;
+  } | null>(null);
 
   // Data State
   const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
   const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [potentialMatches, setPotentialMatches] = useState<Item[]>([]);
   
   // Filter & Search State
   const [typeFilter, setTypeFilter] = useState<'all' | 'LOST' | 'FOUND' | 'CLAIMED'>('all');
   const [catFilter, setCatFilter] = useState('');
   const [locFilter, setLocFilter] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
+
+  // --- Matching Logic ---
+  const findMatchesFor = (item: Item) => {
+    return items.filter(i => 
+      i.id !== item.id && 
+      i.status !== 'CLAIMED' &&
+      i.status !== item.status && // Match LOST with FOUND
+      (i.category === item.category || i.location === item.location) &&
+      (i.title.toLowerCase().includes(item.title.toLowerCase()) || 
+       item.title.toLowerCase().includes(i.title.toLowerCase()))
+    );
+  };
+
+  useEffect(() => {
+    if (selectedItem) {
+      setPotentialMatches(findMatchesFor(selectedItem));
+    } else {
+      setPotentialMatches([]);
+    }
+  }, [selectedItem, items]);
 
   // Configuration Check
   const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
@@ -99,9 +127,58 @@ export default function App() {
     category: '',
     location: '',
     desc: '',
+    verification_question: '',
+    verification_answer: '',
     date: new Date().toISOString().split('T')[0],
     media: [] as File[]
   });
+  const [duplicateMatches, setDuplicateMatches] = useState<Item[]>([]);
+  const [isVerified, setIsVerified] = useState(false);
+  const [userAnswer, setUserAnswer] = useState('');
+
+  const normalizeAnswer = (text: string) => {
+    return text
+      .toLowerCase()
+      .trim()
+      .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "") // Remove punctuation
+      .replace(/\s+/g, " "); // Normalize whitespace
+  };
+
+  const validateVerification = () => {
+    if (!selectedItem) return;
+    
+    const normalizedUser = normalizeAnswer(userAnswer);
+    const normalizedTarget = normalizeAnswer(selectedItem.verification_answer || '');
+    
+    // Basic fuzzy matching: if either is a substring of the other or exact match
+    if (normalizedTarget && (normalizedUser.includes(normalizedTarget) || normalizedTarget.includes(normalizedUser)) && normalizedUser.length >= Math.min(3, normalizedTarget.length)) {
+      setIsVerified(true);
+      showToast("Verification Successful! Contact revealed.", "success");
+    } else {
+      showToast("The answer provided doesn't match the finder's records. Please try to be more specific.", "error");
+    }
+  };
+
+  // Reset verification when item changes
+  useEffect(() => {
+    setIsVerified(false);
+    setUserAnswer('');
+  }, [selectedItem]);
+
+  // Duplicate Check while typing
+  useEffect(() => {
+    if (formData.title.length > 3) {
+      const matches = items.filter(i => 
+        i.status !== 'CLAIMED' &&
+        i.status !== formData.type && // If I report LOST, show me FOUND items
+        (i.title.toLowerCase().includes(formData.title.toLowerCase()) || 
+         formData.title.toLowerCase().includes(i.title.toLowerCase()))
+      );
+      setDuplicateMatches(matches);
+    } else {
+      setDuplicateMatches([]);
+    }
+  }, [formData.title, formData.type, items]);
   const [uploading, setUploading] = useState(false);
 
   // --- Effects ---
@@ -231,7 +308,9 @@ export default function App() {
         location: formData.location,
         reporter_name: formData.name,
         reporter_roll: formData.roll,
-        reporter_email: formData.email
+        reporter_email: formData.email,
+        verification_question: formData.type === 'FOUND' ? formData.verification_question : null,
+        verification_answer: formData.type === 'FOUND' ? formData.verification_answer : null
       }]);
 
       if (error) {
@@ -260,47 +339,128 @@ export default function App() {
   };
 
   const resolveItem = async (id: number) => {
-    if (!confirm('Are you sure you want to mark this item as claimed?')) return;
-    const { error } = await supabase
-      .from('items')
-      .update({ status: 'CLAIMED' })
-      .eq('id', id);
+    console.log('Resolving item:', id);
+    
+    // Save old state in case we need to roll back
+    const oldItems = [...items];
+    
+    // Optimistic Update
+    setItems(prev => prev.map(item => 
+      item.id === id ? { ...item, status: 'CLAIMED' } : item
+    ));
 
-    if (error) {
-      showToast('Error updating status', 'error');
-    } else {
-      showToast('Item marked as resolved!', 'success');
-      const item = items.find(i => i.id === id);
-      if (item) {
-        addNotification({
-          type: 'resolved',
-          itemName: item.title,
-          reportType: item.status as 'LOST' | 'FOUND',
-          reporter: item.reporter_name
-        });
+    try {
+      const { error, data } = await supabase
+        .from('items')
+        .update({ status: 'CLAIMED' })
+        .eq('id', id)
+        .select(); 
+
+      if (error) {
+        showToast('Error updating status', 'error');
+        setItems(oldItems); // Rollback
+      } else if (data && data.length === 0) {
+        showToast('Update failed: Run SQL POLICY for UPDATE in Supabase.', 'error');
+        setItems(oldItems);
+      } else {
+        showToast('Item marked as resolved!', 'success');
+        const item = oldItems.find(i => i.id === id);
+        if (item) {
+          addNotification({
+            type: 'resolved',
+            itemName: item.title,
+            reportType: item.status as 'LOST' | 'FOUND',
+            reporter: item.reporter_name
+          });
+        }
+        setSelectedItem(null);
+        fetchItems();
       }
-      setSelectedItem(null);
-      fetchItems();
+    } catch (err: any) {
+      console.error('Resolve error:', err);
+      showToast('Unexpected error resolving item', 'error');
+      setItems(oldItems);
     }
   };
 
   const deleteItem = async (id: number) => {
-    if (!confirm('Are you sure you want to delete this report?')) return;
-    const { error } = await supabase.from('items').delete().eq('id', id);
-    if (error) {
-      showToast('Error deleting item', 'error');
-    } else {
-      showToast('Item deleted', 'info');
-      fetchItems();
+    console.log('Deleting item:', id);
+    
+    // Save old state
+    const oldItems = [...items];
+    
+    // Optimistic Update
+    setItems(prev => prev.filter(item => item.id !== id));
+
+    try {
+      const { error, data } = await supabase
+        .from('items')
+        .delete()
+        .eq('id', id)
+        .select();
+
+      if (error) {
+        console.error('Database delete error:', error);
+        showToast('Error deleting item', 'error');
+        setItems(oldItems); // Rollback
+      } else if (data && data.length === 0) {
+        // This often happens if RLS is enabled but delete is not allowed for anon users
+        showToast('Delete failed: Run SQL POLICY for DELETE in Supabase.', 'error');
+        setItems(oldItems);
+      } else {
+        showToast('Item deleted successfully', 'info');
+        fetchItems();
+      }
+    } catch (err: any) {
+      console.error('Delete error:', err);
+      showToast('Unexpected error during deletion', 'error');
+      setItems(oldItems);
     }
+  };
+
+  const exportToCSV = () => {
+    if (items.length === 0) {
+      showToast('No data to export!', 'error');
+      return;
+    }
+
+    const headers = ['ID', 'Title', 'Status', 'Category', 'Location', 'Reporter Name', 'Roll', 'Contact', 'Email', 'Created At'];
+    const rows = items.map(item => [
+      item.id,
+      `"${item.title?.replace(/"/g, '""') || ''}"`,
+      item.status,
+      item.category,
+      item.location,
+      `"${item.reporter_name?.replace(/"/g, '""') || ''}"`,
+      item.reporter_roll,
+      item.contact,
+      item.reporter_email,
+      item.created_at
+    ]);
+
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    
+    link.setAttribute('href', url);
+    link.setAttribute('download', `FindIt_Campus_Reports_${new Date().toISOString().split('T')[0]}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    showToast('CSV Exported Successfully!', 'success');
   };
 
   const resetForm = () => {
     setFormData({
       type: '', name: '', roll: '', phone: '', email: '',
       title: '', category: '', location: '', desc: '',
+      verification_question: '',
+      verification_answer: '',
       date: new Date().toISOString().split('T')[0], media: []
     });
+    setDuplicateMatches([]);
   };
 
   const getTimeAgo = (dateStr: string) => {
@@ -540,8 +700,13 @@ export default function App() {
                   <p className="text-text-mid">Manage campus records and platform health.</p>
                 </div>
                 <div className="flex gap-3">
-                   <button className="bg-red-50 text-red-600 font-bold px-6 py-2.5 rounded-xl border border-red-100 hover:bg-red-100 transition-colors" onClick={() => fetchItems()}>Refresh Logic</button>
-                   <button className="bg-navy text-white font-bold px-6 py-2.5 rounded-xl shadow-lg hover:bg-teal transition-all">Export CSV</button>
+                   <button className="bg-red-50 text-red-600 font-bold px-6 py-2.5 rounded-xl border border-red-100 hover:bg-red-100 transition-colors" onClick={() => fetchItems()}>Refresh</button>
+                   <button 
+                     className="bg-navy text-white font-bold px-6 py-2.5 rounded-xl shadow-lg hover:bg-teal transition-all flex items-center gap-2"
+                     onClick={exportToCSV}
+                   >
+                     <FileText size={18} /> Export CSV
+                   </button>
                 </div>
              </div>
 
@@ -612,11 +777,19 @@ export default function App() {
                           <td className="py-4 px-6 text-right">
                              <div className="flex justify-end gap-2">
                                {item.status !== 'CLAIMED' && (
-                                 <button className="w-8 h-8 rounded-lg bg-green-50 text-green-600 flex items-center justify-center hover:bg-green-100 transition-all" title="Mark as resolved" onClick={() => resolveItem(item.id)}>
+                                 <button 
+                                   className="w-8 h-8 rounded-lg bg-green-50 text-green-600 flex items-center justify-center hover:bg-green-100 transition-all font-bold" 
+                                   title="Mark as resolved" 
+                                   onClick={() => setConfirmAction({ id: item.id, type: 'resolve', title: item.title })}
+                                 >
                                    <CheckCircle2 size={16} />
                                  </button>
                                )}
-                               <button className="w-8 h-8 rounded-lg bg-red-50 text-red-500 flex items-center justify-center hover:bg-red-200 transition-all" title="Delete record" onClick={() => deleteItem(item.id)}>
+                               <button 
+                                 className="w-8 h-8 rounded-lg bg-red-50 text-red-500 flex items-center justify-center hover:bg-red-200 transition-all font-bold" 
+                                 title="Delete record" 
+                                 onClick={() => setConfirmAction({ id: item.id, type: 'delete', title: item.title })}
+                               >
                                   <Trash2 size={16} />
                                </button>
                              </div>
@@ -692,6 +865,59 @@ export default function App() {
                  <div className="space-y-1.5">
                     <label className="text-[10px] font-black uppercase text-text-mid px-1">Item Title *</label>
                     <input type="text" placeholder="e.g. Casio Scientific Calculator FX-991" className="w-full bg-beige/50 border-2 border-sky/20 p-3.5 rounded-xl text-sm font-bold outline-none focus:border-navy transition-all" value={formData.title} onChange={(e) => setFormData({...formData, title: e.target.value})} />
+                    
+                    {formData.type === 'FOUND' && (
+                      <div className="mt-4 p-4 bg-teal/5 border-2 border-teal/20 rounded-2xl space-y-4">
+                         <div className="flex items-center gap-2 text-[10px] font-black text-teal uppercase tracking-widest">
+                            <Bell size={12} /> Verification Setup
+                         </div>
+                         <div className="space-y-1.5">
+                            <label className="text-[10px] font-bold text-navy px-1">Proof Challenge (Question) *</label>
+                            <input 
+                              type="text" 
+                              placeholder="e.g. What is the lock screen wallpaper?" 
+                              className="w-full bg-white border border-sky/20 p-3 rounded-xl text-xs font-bold outline-none focus:border-teal transition-all" 
+                              value={formData.verification_question}
+                              onChange={(e) => setFormData({...formData, verification_question: e.target.value})}
+                            />
+                         </div>
+                         <div className="space-y-1.5">
+                            <label className="text-[10px] font-bold text-navy px-1">Expected Answer *</label>
+                            <input 
+                              type="text" 
+                              placeholder="e.g. Picture of my cat" 
+                              className="w-full bg-white border border-sky/20 p-3 rounded-xl text-xs font-bold outline-none focus:border-teal transition-all" 
+                              value={formData.verification_answer}
+                              onChange={(e) => setFormData({...formData, verification_answer: e.target.value})}
+                            />
+                            <p className="text-[9px] text-text-mid italic mt-1 px-1">This will be used to verify the owner before revealing your contact.</p>
+                         </div>
+                      </div>
+                    )}
+                    
+                    {duplicateMatches.length > 0 && (
+                      <div className="mt-3 bg-teal/10 border border-teal/30 p-4 rounded-xl animate-bounce">
+                        <div className="text-[10px] font-bold text-teal flex items-center gap-2 mb-2">
+                           <Bell size={12} /> IS THIS THE ITEM YOU FOUND?
+                        </div>
+                        <p className="text-[10px] text-navy mb-2">Wait! These items were reported LOST. Is one of them what you are reporting?</p>
+                        <div className="space-y-2">
+                           {duplicateMatches.slice(0, 2).map(match => (
+                             <button 
+                               key={match.id} 
+                               className="w-full bg-white/80 p-2 rounded-lg text-[10px] font-bold text-navy flex items-center justify-between hover:bg-white transition-all shadow-sm"
+                               onClick={() => {
+                                 setSelectedItem(match);
+                                 setShowReportModal(false);
+                               }}
+                             >
+                               <span className="flex items-center gap-2">{CAT_EMOJI[match.category] || '📦'} {match.title}</span>
+                               <span className="flex items-center gap-1 text-teal">Contact Owner <ArrowRight size={10} /></span>
+                             </button>
+                           ))}
+                        </div>
+                      </div>
+                    )}
                  </div>
 
                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -856,33 +1082,92 @@ export default function App() {
 
                  <div className="bg-gradient-to-br from-navy to-teal rounded-[32px] p-8 text-white shadow-2xl relative overflow-hidden">
                     <div className="absolute top-0 right-0 w-24 h-24 bg-white opacity-10 rounded-full -mr-10 -mt-10" />
-                    <h4 className="text-xs font-black uppercase tracking-widest opacity-60 mb-6 flex items-center gap-2">
-                       {selectedItem.status === 'LOST' ? '📞 Found this item?' : '📞 Claim this item'}
-                    </h4>
-                    <div className="space-y-5">
-                       <div className="flex items-center gap-5">
-                          <div className="w-12 h-12 rounded-2xl bg-white/10 flex items-center justify-center"><Phone size={20} /></div>
-                          <div>
-                             <div className="text-xl font-bold">{selectedItem.contact}</div>
-                             <div className="text-[10px] opacity-60 font-bold uppercase tracking-tighter">Phone Contact</div>
+                    
+                    {selectedItem.status === 'FOUND' && !isVerified && activePage !== 'admin' ? (
+                       <div className="space-y-4">
+                          <h4 className="text-xs font-black uppercase tracking-widest opacity-60 mb-2 flex items-center gap-2">
+                             🔒 Identity Verification Required
+                          </h4>
+                          <div className="bg-white/10 p-5 rounded-2xl border border-white/20">
+                             <p className="text-[10px] font-bold uppercase tracking-widest opacity-60 mb-2">The Finder Asks:</p>
+                             <p className="text-lg font-serif italic mb-4 leading-tight">"{selectedItem.verification_question || 'Please describe a unique feature of this item to verify ownership.'}"</p>
+                             <input 
+                               type="text" 
+                               placeholder="Type your answer here..."
+                               className="w-full bg-white/10 border-2 border-white/20 p-3.5 rounded-xl text-sm font-bold outline-none focus:border-sky transition-all placeholder:text-white/40 mb-3"
+                               value={userAnswer}
+                               onChange={(e) => setUserAnswer(e.target.value)}
+                               onKeyDown={(e) => {
+                                 if (e.key === 'Enter') {
+                                   validateVerification();
+                                 }
+                               }}
+                             />
+                             <button 
+                               className="w-full bg-sky text-navy font-black py-3 rounded-xl hover:bg-white transition-all uppercase text-[10px] tracking-widest"
+                               onClick={validateVerification}
+                             >
+                               Reveal Contact Details
+                             </button>
+                             <p className="text-[8px] opacity-40 mt-3 text-center uppercase font-bold tracking-tighter">Verified by finder's proof challenge.</p>
                           </div>
                        </div>
-                       {selectedItem.reporter_email && (
-                         <div className="flex items-center gap-5">
-                            <div className="w-12 h-12 rounded-2xl bg-white/10 flex items-center justify-center"><Mail size={20} /></div>
-                            <div>
-                               <div className="text-sm font-bold opacity-90">{selectedItem.reporter_email}</div>
-                               <div className="text-[10px] opacity-60 font-bold uppercase tracking-tighter">Campus Email</div>
-                            </div>
-                         </div>
-                       )}
-                    </div>
+                    ) : (
+                       <>
+                        <h4 className="text-xs font-black uppercase tracking-widest opacity-60 mb-6 flex items-center gap-2">
+                           {selectedItem.status === 'LOST' ? '📞 Found this item?' : '📞 Claim this item'}
+                        </h4>
+                        <div className="space-y-5">
+                           <div className="flex items-center gap-5">
+                              <div className="w-12 h-12 rounded-2xl bg-white/10 flex items-center justify-center"><Phone size={20} /></div>
+                              <div>
+                                 <div className="text-xl font-bold">{selectedItem.contact}</div>
+                                 <div className="text-[10px] opacity-60 font-bold uppercase tracking-tighter">Phone Contact</div>
+                              </div>
+                           </div>
+                           {selectedItem.reporter_email && (
+                             <div className="flex items-center gap-5">
+                                <div className="w-12 h-12 rounded-2xl bg-white/10 flex items-center justify-center"><Mail size={20} /></div>
+                                <div>
+                                   <div className="text-sm font-bold opacity-90">{selectedItem.reporter_email}</div>
+                                   <div className="text-[10px] opacity-60 font-bold uppercase tracking-tighter">Campus Email</div>
+                                </div>
+                             </div>
+                           )}
+                        </div>
+                       </>
+                    )}
                  </div>
                  
                  {selectedItem.status !== 'CLAIMED' && (
-                    <button className="w-full mt-6 bg-green-500 text-white font-bold p-4 rounded-2xl hover:bg-green-600 transition-all flex items-center justify-center gap-2 shadow-lg" onClick={() => resolveItem(selectedItem.id)}>
-                      <CheckCircle2 size={20} /> Mark Item as Reunited / Resolved
-                    </button>
+                    <div className="space-y-4">
+                      {potentialMatches.length > 0 && (
+                        <div className="bg-sky/10 border border-sky/30 rounded-2xl p-4 mb-2 animate-pulse">
+                          <div className="flex items-center gap-2 text-navy font-bold text-xs mb-2">
+                             <Bell size={14} className="text-teal" /> POTENTIAL MATCHES FOUND ({potentialMatches.length})
+                          </div>
+                          <div className="space-y-2">
+                            {potentialMatches.slice(0, 2).map(match => (
+                              <button 
+                                key={match.id}
+                                className="w-full bg-white/60 hover:bg-white p-2 rounded-lg text-left text-[10px] flex items-center justify-between group transition-all"
+                                onClick={() => setSelectedItem(match)}
+                              >
+                                <span className="font-bold text-navy">{CAT_EMOJI[match.category]} {match.title}</span>
+                                <ArrowRight size={12} className="text-sky group-hover:translate-x-1 transition-all" />
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      
+                      <button 
+                        className="w-full mt-6 bg-green-500 text-white font-bold p-4 rounded-2xl hover:bg-green-600 transition-all flex items-center justify-center gap-2 shadow-lg" 
+                        onClick={() => setConfirmAction({ id: selectedItem.id, type: 'resolve', title: selectedItem.title })}
+                      >
+                        <CheckCircle2 size={20} /> Mark Item as Reunited / Resolved
+                      </button>
+                    </div>
                  )}
               </div>
            </div>
@@ -893,6 +1178,42 @@ export default function App() {
       {toast && (
         <div className={`toast fixed bottom-6 right-6 px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-3 animate-fadeUp z-[1000] border-l-8 ${toast.type === 'success' ? 'bg-navy border-green-500' : (toast.type === 'error' ? 'bg-navy border-red-500' : 'bg-navy border-sky')}`}>
           <div className="text-white font-bold text-sm">{toast.msg}</div>
+        </div>
+      )}
+
+      {/* Confirmation Modal */}
+      {confirmAction && (
+        <div className="modal-overlay z-[1000]">
+          <div className="bg-white rounded-[32px] w-[95%] max-w-md p-8 shadow-2xl animate-modalIn border-t-8 border-navy mx-auto">
+            <div className="w-16 h-16 bg-beige rounded-2xl flex items-center justify-center text-navy mb-6 mx-auto">
+              {confirmAction.type === 'delete' ? <Trash2 size={32} /> : <CheckCircle2 size={32} />}
+            </div>
+            <h3 className="text-2xl font-serif font-bold text-navy text-center mb-2">
+              {confirmAction.type === 'delete' ? 'Confirm Deletion' : 'Mark as Resolved?'}
+            </h3>
+            <p className="text-text-mid text-center mb-8">
+              Are you sure you want to {confirmAction.type === 'delete' ? 'delete' : 'resolve'} the report for <span className="font-bold text-navy">"{confirmAction.title}"</span>? 
+              {confirmAction.type === 'delete' && ' This action cannot be undone.'}
+            </p>
+            <div className="grid grid-cols-2 gap-4">
+              <button 
+                className="py-4 rounded-2xl bg-beige text-navy font-bold hover:bg-sky/20 transition-all"
+                onClick={() => setConfirmAction(null)}
+              >
+                Cancel
+              </button>
+              <button 
+                className={`py-4 rounded-2xl text-white font-bold transition-all shadow-lg ${confirmAction.type === 'delete' ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`}
+                onClick={() => {
+                  if (confirmAction.type === 'delete') deleteItem(confirmAction.id);
+                  else resolveItem(confirmAction.id);
+                  setConfirmAction(null);
+                }}
+              >
+                Yes, {confirmAction.type === 'delete' ? 'Delete' : 'Resolve'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
