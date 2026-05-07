@@ -84,6 +84,10 @@ export default function App() {
   const [locFilter, setLocFilter] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
 
+  // Configuration Check
+  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+  const isConfigured = supabaseUrl && !supabaseUrl.includes('your-project-id') && !supabaseUrl.includes('placeholder');
+
   // Form State
   const [formData, setFormData] = useState({
     type: '' as 'LOST' | 'FOUND' | '',
@@ -161,13 +165,30 @@ export default function App() {
       const fileName = `${Math.random()}.${fileExt}`;
       const filePath = `${fileName}`;
 
-      const { error: uploadError } = await supabase.storage
+      const { data, error: uploadError } = await supabase.storage
         .from('item-images')
         .upload(filePath, file);
 
       if (uploadError) {
-        console.error('Upload error:', uploadError);
-        continue;
+        console.error('Supabase Storage Error Details:', uploadError);
+        
+        // Handle 404 (Bucket not found)
+        if (uploadError.message === 'The resource was not found' || (uploadError as any).status === 404) {
+          throw new Error('Bucket Not Found! Please go to Supabase -> Storage, create a bucket named exactly "item-images" and set it to PUBLIC.');
+        }
+        
+        // Handle 403 (Permission denied)
+        if (uploadError.message.toLowerCase().includes('permission') || (uploadError as any).status === 403) {
+          throw new Error('Permission Denied! In Supabase SQL Editor, run this: \n\n' + 
+            'CREATE POLICY "Allow Anon Upload" ON storage.objects FOR INSERT WITH CHECK (bucket_id = \'item-images\'); \n' +
+            'CREATE POLICY "Allow Anon Select" ON storage.objects FOR SELECT USING (bucket_id = \'item-images\');');
+        }
+
+        throw new Error(`Storage Upload Failed: ${uploadError.message} (Status: ${(uploadError as any).status})`);
+      }
+
+      if (!data) {
+        throw new Error('Upload succeeded but no data was returned from Supabase.');
       }
 
       const { data: { publicUrl } } = supabase.storage
@@ -189,20 +210,14 @@ export default function App() {
     setUploading(true);
     try {
       // 1. Check Connection/Config
-      if (import.meta.env.VITE_SUPABASE_URL.includes('your-project-id')) {
-        throw new Error('Supabase URL is not configured. Please add your real Supabase URL and Key to your Environment Variables.');
+      const currentUrl = import.meta.env.VITE_SUPABASE_URL;
+      if (!currentUrl || currentUrl.includes('placeholder') || currentUrl.includes('your-project-id')) {
+        throw new Error('Supabase is not connected. Please go to "Settings" -> "Secrets" and add your real VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY from Supabase Project Settings -> API.');
       }
 
       let media_urls: string[] = [];
       if (formData.media.length > 0) {
-        try {
-          media_urls = await handleFileUpload(formData.media);
-          if (formData.media.length > 0 && media_urls.length === 0) {
-            throw new Error('Media upload failed. Please check if your "item-images" bucket exists in Supabase and is set to Public.');
-          }
-        } catch (storageErr: any) {
-          throw new Error(`Storage Error: ${storageErr.message || 'Check your bucket name and policies.'}`);
-        }
+        media_urls = await handleFileUpload(formData.media);
       }
 
       // 2. Database Insert
@@ -216,8 +231,7 @@ export default function App() {
         location: formData.location,
         reporter_name: formData.name,
         reporter_roll: formData.roll,
-        reporter_email: formData.email,
-        date: formData.date
+        reporter_email: formData.email
       }]);
 
       if (error) {
@@ -312,6 +326,12 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-beige selection:bg-teal selection:text-white">
+      {!isConfigured && (
+        <div className="bg-red-600 text-white p-3 text-sm font-bold flex items-center justify-center gap-4 animate-pulse">
+          <Bell size={20} />
+          <span>Supabase is not connected! Please add your VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to your Secrets.</span>
+        </div>
+      )}
       <Navbar 
         activePage={activePage} 
         setActivePage={setActivePage} 

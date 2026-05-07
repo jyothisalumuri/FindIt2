@@ -4,10 +4,13 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabaseAnonKey) {
-  console.warn('Supabase URL or Anon Key is missing. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in your secrets.');
+  const errorMsg = 'CRITICAL CONFIG ERROR: Supabase environment variables are missing. ' +
+    'Please ensure you have added VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to your Secrets. ' +
+    '(Note: Do NOT use NEXT_PUBLIC_ prefix, it must be VITE_)';
+  console.error(errorMsg);
 }
 
 export const supabase = createClient(
-  supabaseUrl || 'https://placeholder.supabase.co',
-  supabaseAnonKey || 'placeholder'
+  supabaseUrl || 'https://MISSING_CONFIG.supabase.co',
+  supabaseAnonKey || 'MISSING_KEY'
 );
